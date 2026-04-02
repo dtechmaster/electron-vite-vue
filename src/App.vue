@@ -286,9 +286,11 @@ html, body, #app {
 
 /*#region Print */
 @media print {
-  #controls { display: none !important; }
-  .content-area { display: block; overflow: visible; }
-  .form-area { display: block; overflow: visible; }
+  #controls     { display: none !important; }
+  .content-area { display: block; overflow: visible; padding: 0; margin: 0; }
+  /* Hide sidebar — only the form area should print */
+  .content-area > *:not(.form-area) { display: none !important; }
+  .form-area    { display: block; overflow: visible; padding: 0; margin: 0; }
 }
 /*#endregion*/
 </style>

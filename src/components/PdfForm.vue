@@ -3,7 +3,7 @@
 import { ref, reactive, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import * as pdfjsLib from 'pdfjs-dist'
 import $formStore from '../composables/$formStore'
-import type { IField, IFieldPos, IFieldStyle } from '../types'
+import type { IField, IFieldPos, IFieldStyle, IFieldType } from '../types'
 //#endregion
 
 //#region Props & Emits
@@ -500,6 +500,16 @@ function resetFieldStyle(): void {
   savedStyles.value = next
   $formStore.deleteStyle(id)
 }
+
+function changeFieldType(newType: IFieldType): void {
+  const id  = activeFieldId.value
+  if (!id) return
+  fields.value = fields.value.map(f =>
+    f.id === id ? { ...f, type: newType } : f
+  )
+  $formStore.saveFields(fields.value)
+  formData[id] = (newType === 'checkbox' || newType === 'radio') ? false : ''
+}
 //#endregion
 
 // Expose for parent (print)
@@ -625,6 +635,19 @@ defineExpose({ calibrateMode, resetPositions, detectAnnotations, addField })
           @mousedown="onFieldMouseDown($event, field)"
         />
 
+        <!-- Radio -->
+        <input
+          v-else-if="field.type === 'radio'"
+          :id="field.id"
+          class="pdf-input pdf-radio"
+          type="radio"
+          :style="getStyle(field)"
+          :title="field.label"
+          :checked="(formData[field.id] as boolean) ?? false"
+          @change="onCheckboxChange($event, field.id)"
+          @mousedown="onFieldMouseDown($event, field)"
+        />
+
         <!-- Text -->
         <input
           v-else
@@ -676,6 +699,16 @@ defineExpose({ calibrateMode, resetPositions, detectAnnotations, addField })
           @click.stop
         >
           <span class="toolbar-field-id">{{ activeFieldId }}</span>
+
+          <div class="toolbar-type-group">
+            <button
+              v-for="t in (['text','textarea','checkbox','radio'] as IFieldType[])"
+              :key="t"
+              class="toolbar-type-btn"
+              :class="{ active: resolvedFields.find(f => f.id === activeFieldId)?.type === t }"
+              @click="changeFieldType(t)"
+            >{{ { text: 'T', textarea: '¶', checkbox: '☑', radio: '◉' }[t] }}</button>
+          </div>
 
           <label class="toolbar-item">
             <span>Aa</span>
@@ -912,7 +945,8 @@ defineExpose({ calibrateMode, resetPositions, detectAnnotations, addField })
   z-index: 50;
 }
 
-.pdf-checkbox {
+.pdf-checkbox,
+.pdf-radio {
   background: transparent;
   border: 1px dashed rgba(100, 160, 255, 0.4);
   padding: 0;
@@ -945,7 +979,9 @@ textarea.pdf-input {
   border: 1.5px solid rgba(255, 60, 60, 0.7) !important;
   cursor: grab !important;
 }
-.calibrate .pdf-input:active { cursor: grabbing !important; }
+.calibrate .pdf-input:active  { cursor: grabbing !important; }
+.calibrate .pdf-checkbox,
+.calibrate .pdf-radio { cursor: grab !important; }
 
 /* Field remove button */
 .field-remove {
@@ -1006,6 +1042,32 @@ textarea.pdf-input {
   color: #cdd6f4;
   pointer-events: all;
 }
+
+.toolbar-type-group {
+  display: flex;
+  gap: 2px;
+  border-right: 1px solid #313244;
+  padding-right: 6px;
+  margin-right: 2px;
+}
+
+.toolbar-type-btn {
+  width: 22px;
+  height: 22px;
+  background: #313244;
+  border: 1px solid #45475a;
+  border-radius: 3px;
+  color: #a6adc8;
+  font-size: 11px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  transition: background 0.1s, color 0.1s;
+}
+.toolbar-type-btn:hover  { background: #45475a; }
+.toolbar-type-btn.active { background: #89b4fa; color: #1e1e2e; border-color: #89b4fa; }
 
 .toolbar-field-id {
   font-size: 10px;
@@ -1073,40 +1135,60 @@ textarea.pdf-input {
 
 /*#region Print */
 @media print {
-  .calibrate-banner { display: none !important; }
-  .form-scroll { padding: 0; display: block; }
+  /* Hide all UI chrome — only the PDF + field inputs should print */
+  .loading-msg,
+  .calibrate-banner,
+  .detect-panel,
+  .style-toolbar,
+  .resize-handle,
+  .field-remove { display: none !important; }
+
+  .form-scroll {
+    padding: 0;
+    margin: 0;
+    display: block;
+    overflow: visible;
+  }
 
   .form-container {
-    width: 210mm !important;
-    height: 297mm !important;
     display: block !important;
-    overflow: hidden;
+    width: 100% !important;
+    height: auto !important;
+    overflow: visible !important;
     box-shadow: none !important;
+    margin: 0;
+    padding: 0;
   }
 
   .pdf-img {
-    position: absolute;
-    top: 0; left: 0;
+    display: block;
     width: 100% !important;
-    height: 100% !important;
-    object-fit: fill !important;
+    height: auto !important;
+    position: static !important;
   }
 
   .pdf-input {
     background: transparent !important;
     border: none !important;
+    outline: none !important;
     box-shadow: none !important;
     color: #000 !important;
     print-color-adjust: exact;
     -webkit-print-color-adjust: exact;
   }
 
-  .pdf-checkbox {
+  .pdf-checkbox,
+  .pdf-radio {
     print-color-adjust: exact;
     -webkit-print-color-adjust: exact;
     -webkit-appearance: checkbox;
     appearance: checkbox;
     color-scheme: light;
+  }
+
+  .pdf-radio {
+    -webkit-appearance: radio;
+    appearance: radio;
   }
 }
 /*#endregion*/

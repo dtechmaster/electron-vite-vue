@@ -3,7 +3,7 @@ import { z } from 'zod'
 // #endregion
 
 // #region Field Schema
-export const TFieldType = z.enum(['text', 'textarea', 'checkbox'])
+export const TFieldType = z.enum(['text', 'textarea', 'checkbox', 'radio'])
 export type IFieldType = z.infer<typeof TFieldType>
 
 export const TField = z.object({

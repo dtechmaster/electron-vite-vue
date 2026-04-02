@@ -37,3 +37,13 @@ export type IFieldPos = z.infer<typeof TFieldPos>
 export const TFormData = z.record(z.union([z.string(), z.boolean()]))
 export type IFormData = z.infer<typeof TFormData>
 // #endregion
+
+// #region Field Style Schema
+export const TFieldStyle = z.object({
+  fontSize:      z.string().optional(),
+  color:         z.string().optional(),
+  background:    z.string().optional(),
+  letterSpacing: z.string().optional(),
+})
+export type IFieldStyle = z.infer<typeof TFieldStyle>
+// #endregion

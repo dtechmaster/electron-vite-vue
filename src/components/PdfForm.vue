@@ -4,7 +4,7 @@ import { ref, reactive, computed, watch, onMounted, onUnmounted, nextTick } from
 import * as pdfjsLib from 'pdfjs-dist'
 import $fields from '../composables/$fields'
 import $formStore from '../composables/$formStore'
-import type { IField, IFieldPos } from '../types'
+import type { IField, IFieldPos, IFieldStyle } from '../types'
 //#endregion
 
 //#region Props & Emits
@@ -12,6 +12,7 @@ interface Props {
   filePath:        string
   pdfBuffer:       ArrayBuffer
   initialFormData: Record<string, string | boolean>
+  previewMode?:    boolean
 }
 const props = defineProps<Props>()
 const emit  = defineEmits<{
@@ -21,11 +22,12 @@ const emit  = defineEmits<{
 //#endregion
 
 //#region PDF.js Worker
-pdfjsLib.GlobalWorkerOptions.workerSrc = './pdf.worker.mjs'
+pdfjsLib.GlobalWorkerOptions.workerSrc = './pdf.worker.js'
 //#endregion
 
 //#region State
 const isLoaded      = ref(false)
+const loadError     = ref<string | null>(null)
 const pdfImgSrc     = ref('')
 const containerRef  = ref<HTMLDivElement | null>(null)
 const containerH    = ref(0)
@@ -34,6 +36,10 @@ const mouseCoords   = ref('—')
 const selectedField = ref('—')
 
 const savedPositions = ref<Record<string, IFieldPos>>($formStore.loadPositions())
+const savedStyles    = ref<Record<string, IFieldStyle>>($formStore.loadStyles())
+
+const activeFieldId = ref<string | null>(null)
+const toolbarPos    = ref({ top: 0, left: 0 })
 
 const formData = reactive<Record<string, string | boolean>>({
   ...$fields.initial(),
@@ -82,20 +88,26 @@ function scheduleSave(): void {
 
 //#region PDF Rendering
 async function renderPDF(buffer: ArrayBuffer): Promise<void> {
-  isLoaded.value = false
+  isLoaded.value  = false
+  loadError.value = null
   pdfImgSrc.value = ''
 
-  const pdf      = await pdfjsLib.getDocument({ data: new Uint8Array(buffer) }).promise
-  const page     = await pdf.getPage(1)
-  const viewport = page.getViewport({ scale: 2.0 })
-  const canvas   = document.createElement('canvas')
-  canvas.width   = viewport.width
-  canvas.height  = viewport.height
+  try {
+    const pdf      = await pdfjsLib.getDocument({ data: new Uint8Array(buffer) }).promise
+    const page     = await pdf.getPage(1)
+    const viewport = page.getViewport({ scale: 2.0 })
+    const canvas   = document.createElement('canvas')
+    canvas.width   = viewport.width
+    canvas.height  = viewport.height
 
-  await page.render({ canvasContext: canvas.getContext('2d')!, viewport }).promise
+    await page.render({ canvasContext: canvas.getContext('2d')!, viewport }).promise
 
-  pdfImgSrc.value = canvas.toDataURL('image/png')
-  isLoaded.value  = true
+    pdfImgSrc.value = canvas.toDataURL('image/png')
+    isLoaded.value  = true
+  } catch (err) {
+    loadError.value = err instanceof Error ? err.message : String(err)
+    console.error('[PdfForm] renderPDF failed:', err)
+  }
 }
 
 // Re-render whenever the PDF buffer changes (file switch)
@@ -106,9 +118,10 @@ watch(() => props.pdfBuffer, buf => { if (buf) renderPDF(buf) }, { immediate: tr
 watch(
   () => props.filePath,
   () => {
-    history.value      = []
-    historyIndex.value = -1
+    history.value       = []
+    historyIndex.value  = -1
     calibrateMode.value = false
+    activeFieldId.value = null
     Object.assign(formData, $fields.initial(), props.initialFormData)
     nextTick(pushHistory)
   },
@@ -162,14 +175,8 @@ function focusBangouCell(idx: number): void {
 }
 //#endregion
 
-//#region Calibration — Ctrl+Click to enter, ESC to exit, drag to reposition
+//#region Calibration — toggle button to enter, ESC to exit, drag to reposition / resize
 function onFieldMouseDown(e: MouseEvent, field: IField): void {
-  // Ctrl+Click → enter calibration mode
-  if (e.ctrlKey && !calibrateMode.value) {
-    e.preventDefault()
-    calibrateMode.value = true
-  }
-
   if (!calibrateMode.value) return
   e.preventDefault()
 
@@ -201,6 +208,54 @@ function onFieldMouseDown(e: MouseEvent, field: IField): void {
   document.addEventListener('mouseup',   onUp)
 }
 
+function onResizeMouseDown(e: MouseEvent, field: IField): void {
+  e.preventDefault()
+
+  const cr     = containerRef.value!.getBoundingClientRect()
+  const startX = e.clientX
+  const startY = e.clientY
+  const startW = parseFloat(savedPositions.value[field.id]?.width  ?? field.width  ?? '10')
+  const startH = parseFloat(savedPositions.value[field.id]?.height ?? field.height ?? '2')
+
+  function onMove(mv: MouseEvent) {
+    const width  = Math.max(1,   startW + (mv.clientX - startX) / cr.width  * 100).toFixed(2) + '%'
+    const height = Math.max(0.5, startH + (mv.clientY - startY) / cr.height * 100).toFixed(2) + '%'
+    savedPositions.value = {
+      ...savedPositions.value,
+      [field.id]: { ...(savedPositions.value[field.id] ?? {}), width, height },
+    }
+    selectedField.value = `[${field.id}]  w: ${width}  h: ${height}`
+  }
+
+  function onUp() {
+    document.removeEventListener('mousemove', onMove)
+    document.removeEventListener('mouseup',   onUp)
+    const pos = savedPositions.value[field.id]
+    if (pos) $formStore.savePosition(field.id, pos)
+  }
+
+  document.addEventListener('mousemove', onMove)
+  document.addEventListener('mouseup',   onUp)
+}
+
+const resizableFields = computed(() =>
+  resolvedFields.value.filter(f => {
+    if (f.type === 'checkbox') return false
+    const saved = savedPositions.value[f.id]
+    return (saved?.width ?? f.width) && (saved?.height ?? f.height)
+  })
+)
+
+function getResizeHandleStyle(field: IField): Record<string, string> {
+  const saved = savedPositions.value[field.id]
+  const w = saved?.width  ?? field.width  ?? '0%'
+  const h = saved?.height ?? field.height ?? '0%'
+  return {
+    left: `calc(${field.left} + ${w} - 7px)`,
+    top:  `calc(${field.top}  + ${h} - 7px)`,
+  }
+}
+
 function onContainerMouseMove(e: MouseEvent): void {
   if (!calibrateMode.value) return
   const r = containerRef.value!.getBoundingClientRect()
@@ -218,10 +273,11 @@ function onImgLoad(e: Event): void {
 function onGlobalKeyDown(e: KeyboardEvent): void {
   if (e.ctrlKey && e.key === 'z') { e.preventDefault(); undo() }
   if (e.ctrlKey && e.key === 'y') { e.preventDefault(); redo() }
-  if (e.key === 'Escape' && calibrateMode.value) {
+  if (e.key === 'Escape') {
     calibrateMode.value = false
     selectedField.value = '—'
     mouseCoords.value   = '—'
+    activeFieldId.value = null
   }
 }
 
@@ -241,6 +297,14 @@ function getStyle(field: IField): Record<string, string> {
   }
   if (field.size)   style.fontSize = field.size
   if (field.xstyle) Object.assign(style, field.xstyle)
+
+  // Apply per-field style overrides
+  const s = savedStyles.value[field.id]
+  if (s?.fontSize)      style.fontSize      = s.fontSize
+  if (s?.color)         style.color         = s.color
+  if (s?.background)    style.background    = s.background
+  if (s?.letterSpacing) style.letterSpacing = s.letterSpacing
+
   return style
 }
 //#endregion
@@ -253,13 +317,79 @@ function resetPositions(): void {
 }
 //#endregion
 
+//#region Field Selection & Style Toolbar
+function selectField(id: string): void {
+  activeFieldId.value = id
+  nextTick(updateToolbarPos)
+}
+
+function updateToolbarPos(): void {
+  if (!activeFieldId.value || !containerRef.value) return
+  const el = document.getElementById(activeFieldId.value)
+  if (!el) return
+  const cr      = containerRef.value.getBoundingClientRect()
+  const fr      = el.getBoundingClientRect()
+  const relTop  = fr.top  - cr.top
+  const relLeft = fr.left - cr.left
+  const TOOLBAR_H = 40
+  const top  = relTop > TOOLBAR_H + 4 ? relTop - TOOLBAR_H - 4 : fr.bottom - cr.top + 4
+  toolbarPos.value = { top, left: Math.max(0, relLeft) }
+}
+
+function getPxVal(cssStr: string | undefined, fallback: number): number {
+  if (!cssStr) return fallback
+  const n = parseFloat(cssStr)
+  return isNaN(n) ? fallback : n
+}
+
+const activeStyleVals = computed(() => {
+  const id    = activeFieldId.value ?? ''
+  const saved = savedStyles.value[id] ?? {}
+  const field = resolvedFields.value.find(f => f.id === id)
+  return {
+    fontSize:      getPxVal(saved.fontSize,      getPxVal(field?.size, 11)),
+    color:         saved.color         ?? '#000000',
+    background:    saved.background    ?? '#fafa50',
+    letterSpacing: getPxVal(saved.letterSpacing, 0),
+  }
+})
+
+function setFieldStyle(key: keyof IFieldStyle, raw: string): void {
+  const id = activeFieldId.value
+  if (!id) return
+  const next = { ...(savedStyles.value[id] ?? {}), [key]: raw }
+  savedStyles.value = { ...savedStyles.value, [id]: next }
+  $formStore.saveStyle(id, next)
+}
+
+function onSizeChange(e: Event): void {
+  setFieldStyle('fontSize', (e.target as HTMLInputElement).value + 'px')
+}
+
+function onSpacingChange(e: Event): void {
+  setFieldStyle('letterSpacing', (e.target as HTMLInputElement).value + 'px')
+}
+
+function resetFieldStyle(): void {
+  const id = activeFieldId.value
+  if (!id) return
+  const next = { ...savedStyles.value }
+  delete next[id]
+  savedStyles.value = next
+  $formStore.deleteStyle(id)
+}
+//#endregion
+
 // Expose for parent (print)
 defineExpose({ calibrateMode, resetPositions })
 </script>
 
 <template>
   <!--#region Loading -->
-  <div v-if="!isLoaded" class="loading-msg">PDFを読み込み中...</div>
+  <div v-if="!isLoaded" class="loading-msg">
+    <span v-if="loadError" style="color:#f38ba8">⚠ PDF読み込みエラー: {{ loadError }}</span>
+    <span v-else>PDFを読み込み中...</span>
+  </div>
   <!--#endregion-->
 
   <!--#region Calibration Banner -->
@@ -279,9 +409,10 @@ defineExpose({ calibrateMode, resetPositions })
     <div
       ref="containerRef"
       class="form-container"
-      :class="{ calibrate: calibrateMode }"
+      :class="{ calibrate: calibrateMode, preview: props.previewMode }"
       :style="{ height: containerH > 0 ? containerH + 'px' : 'auto' }"
       @mousemove="onContainerMouseMove"
+      @click.self="activeFieldId = null"
     >
       <img
         :src="pdfImgSrc"
@@ -299,11 +430,13 @@ defineExpose({ calibrateMode, resetPositions })
           v-if="field.type === 'textarea'"
           :id="field.id"
           class="pdf-input"
+          :class="{ 'field-active': activeFieldId === field.id }"
           :style="getStyle(field)"
           :title="field.label"
           :value="(formData[field.id] as string) ?? ''"
           @input="onTextInput($event, field)"
           @mousedown="onFieldMouseDown($event, field)"
+          @focus="selectField(field.id)"
         />
 
         <!-- Checkbox -->
@@ -324,6 +457,7 @@ defineExpose({ calibrateMode, resetPositions })
           v-else
           :id="field.id"
           class="pdf-input"
+          :class="{ 'field-active': activeFieldId === field.id }"
           type="text"
           :style="getStyle(field)"
           :title="field.label"
@@ -333,9 +467,76 @@ defineExpose({ calibrateMode, resetPositions })
           @input="onTextInputAutoAdvance($event, field)"
           @keydown="onKeyDown($event, field)"
           @mousedown="onFieldMouseDown($event, field)"
+          @focus="selectField(field.id)"
         />
 
       </template>
+      <!--#endregion-->
+
+      <!--#region Resize Handles (calibration mode only) -->
+      <template v-if="calibrateMode">
+        <div
+          v-for="field in resizableFields"
+          :key="'r-' + field.id"
+          class="resize-handle"
+          :style="getResizeHandleStyle(field)"
+          @mousedown.stop="onResizeMouseDown($event, field)"
+        />
+      </template>
+      <!--#endregion-->
+
+      <!--#region Style Toolbar -->
+      <Transition name="toolbar">
+        <div
+          v-if="activeFieldId && !props.previewMode && !calibrateMode"
+          class="style-toolbar"
+          :style="{ top: toolbarPos.top + 'px', left: toolbarPos.left + 'px' }"
+          @mousedown.stop
+          @click.stop
+        >
+          <span class="toolbar-field-id">{{ activeFieldId }}</span>
+
+          <label class="toolbar-item">
+            <span>Aa</span>
+            <input
+              type="number" min="6" max="72" step="1"
+              :value="activeStyleVals.fontSize"
+              @change="onSizeChange"
+            />
+            <span>px</span>
+          </label>
+
+          <label class="toolbar-item">
+            <span>文字色</span>
+            <input
+              type="color"
+              :value="activeStyleVals.color"
+              @input="setFieldStyle('color', ($event.target as HTMLInputElement).value)"
+            />
+          </label>
+
+          <label class="toolbar-item">
+            <span>背景</span>
+            <input
+              type="color"
+              :value="activeStyleVals.background"
+              @input="setFieldStyle('background', ($event.target as HTMLInputElement).value)"
+            />
+          </label>
+
+          <label class="toolbar-item">
+            <span>字間</span>
+            <input
+              type="number" min="-5" max="20" step="0.5"
+              :value="activeStyleVals.letterSpacing"
+              @change="onSpacingChange"
+            />
+            <span>px</span>
+          </label>
+
+          <button class="toolbar-reset" title="スタイルをリセット" @click="resetFieldStyle">↺</button>
+        </div>
+      </Transition>
       <!--#endregion-->
     </div>
   </div>
@@ -467,6 +668,14 @@ textarea.pdf-input {
   overflow: hidden;
 }
 
+/* Preview: transparent fields, no borders — simulates print output */
+.preview .pdf-input {
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  pointer-events: none;
+}
+
 /* Calibration: red + grab cursor */
 .calibrate .pdf-input {
   background: rgba(255, 80, 80, 0.18) !important;
@@ -475,8 +684,106 @@ textarea.pdf-input {
 }
 .calibrate .pdf-input:active { cursor: grabbing !important; }
 
-/* Ctrl held: show grab cursor as hint even before calibrate mode */
-:global(body.ctrl-held) .pdf-input { cursor: crosshair !important; }
+/* Resize handle */
+.resize-handle {
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  background: #fab387;
+  border: 1px solid #1e1e2e;
+  border-radius: 2px;
+  cursor: se-resize;
+  z-index: 80;
+}
+.resize-handle:hover { background: #fe640b; }
+
+/* Selected field highlight */
+.pdf-input.field-active {
+  outline: 2px solid #89b4fa !important;
+  z-index: 60;
+}
+/*#endregion*/
+
+/*#region Style Toolbar */
+.style-toolbar {
+  position: absolute;
+  z-index: 150;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: #181825;
+  border: 1px solid #45475a;
+  border-radius: 6px;
+  padding: 4px 8px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+  white-space: nowrap;
+  font-size: 11px;
+  color: #cdd6f4;
+  pointer-events: all;
+}
+
+.toolbar-field-id {
+  font-size: 10px;
+  color: #6c7086;
+  font-family: monospace;
+  border-right: 1px solid #313244;
+  padding-right: 6px;
+  margin-right: 2px;
+  max-width: 80px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.toolbar-item {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  color: #a6adc8;
+  font-size: 11px;
+  cursor: default;
+  padding: 0 4px;
+  border-right: 1px solid #313244;
+}
+
+.toolbar-item span { user-select: none; }
+
+.toolbar-item input[type='number'] {
+  width: 40px;
+  background: #313244;
+  border: 1px solid #45475a;
+  border-radius: 3px;
+  color: #cdd6f4;
+  font-size: 11px;
+  padding: 1px 3px;
+  text-align: center;
+  outline: none;
+}
+.toolbar-item input[type='number']:focus { border-color: #89b4fa; }
+
+.toolbar-item input[type='color'] {
+  width: 22px;
+  height: 22px;
+  border: 1px solid #45475a;
+  border-radius: 3px;
+  padding: 1px;
+  background: #313244;
+  cursor: pointer;
+}
+
+.toolbar-reset {
+  background: transparent;
+  border: none;
+  color: #6c7086;
+  font-size: 14px;
+  cursor: pointer;
+  padding: 0 2px;
+  line-height: 1;
+  transition: color 0.1s;
+}
+.toolbar-reset:hover { color: #f38ba8; }
+
+.toolbar-enter-active, .toolbar-leave-active { transition: opacity 0.1s, transform 0.1s; }
+.toolbar-enter-from, .toolbar-leave-to { opacity: 0; transform: translateY(-4px); }
 /*#endregion*/
 
 /*#region Print */

@@ -10,6 +10,7 @@ const fileList    = ref<IFileMeta[]>([])
 const currentFile = ref<ILoadedFile | null>(null)
 const pdfFormRef  = ref<InstanceType<typeof PdfForm> | null>(null)
 const errorMsg    = ref<string | null>(null)
+const previewMode = ref(false)
 //#endregion
 
 //#region Load file list on startup + auto-open last file
@@ -67,20 +68,34 @@ async function onSave(data: Record<string, string | boolean>): Promise<void> {
 function printForm(): void { window.electronAPI.print() }
 //#endregion
 
-//#region Ctrl key visual hint
-function onKeyDown(e: KeyboardEvent) { if (e.ctrlKey) document.body.classList.add('ctrl-held') }
-function onKeyUp(e: KeyboardEvent)   { if (!e.ctrlKey) document.body.classList.remove('ctrl-held') }
+//#region Move mode toggle
+function toggleMoveMode(): void {
+  if (!pdfFormRef.value) return
+  pdfFormRef.value.calibrateMode = !pdfFormRef.value.calibrateMode
+}
 //#endregion
 </script>
 
 <template>
-  <div class="app-layout" @keydown="onKeyDown" @keyup="onKeyUp">
+  <div class="app-layout">
 
     <!--#region Controls Bar -->
     <header id="controls">
       <span class="app-title">異動届出書 入力ツール</span>
       <div class="btn-group">
         <button class="btn btn-blue" @click="openPDF">🗂 PDF を開く</button>
+        <button
+          v-if="currentFile"
+          class="btn"
+          :class="pdfFormRef?.calibrateMode ? 'btn-active' : 'btn-outline'"
+          @click="toggleMoveMode"
+        >✥ 移動</button>
+        <button
+          v-if="currentFile"
+          class="btn"
+          :class="previewMode ? 'btn-active' : 'btn-outline'"
+          @click="previewMode = !previewMode"
+        >👁 プレビュー</button>
         <button
           v-if="currentFile"
           class="btn btn-green"
@@ -112,6 +127,7 @@ function onKeyUp(e: KeyboardEvent)   { if (!e.ctrlKey) document.body.classList.r
           :file-path="currentFile.filePath"
           :pdf-buffer="currentFile.pdfData"
           :initial-form-data="currentFile.formData"
+          :preview-mode="previewMode"
           @save="onSave"
         />
 
@@ -122,8 +138,7 @@ function onKeyUp(e: KeyboardEvent)   { if (!e.ctrlKey) document.body.classList.r
           <button class="btn btn-blue btn-lg" @click="openPDF">🗂 PDF を開く</button>
           <p class="empty-hint">
             入力内容は自動的に保存されます<br>
-            <kbd>Ctrl+Z</kbd> / <kbd>Ctrl+Y</kbd> で元に戻す / やり直し<br>
-            <kbd>Ctrl+クリック</kbd> でフィールド位置を調整
+            <kbd>Ctrl+Z</kbd> / <kbd>Ctrl+Y</kbd> で元に戻す / やり直し
           </p>
         </div>
       </div>
@@ -192,8 +207,11 @@ html, body, #app {
 }
 .btn:hover  { opacity: 0.85; }
 .btn:active { transform: scale(0.97); }
-.btn-green  { background: #a6e3a1; color: #1e1e2e; }
-.btn-blue   { background: #89b4fa; color: #1e1e2e; }
+.btn-green   { background: #a6e3a1; color: #1e1e2e; }
+.btn-blue    { background: #89b4fa; color: #1e1e2e; }
+.btn-outline { background: transparent; border: 1px solid #45475a; color: #cdd6f4; }
+.btn-outline:hover { border-color: #cdd6f4; }
+.btn-active  { background: #cba6f7; color: #1e1e2e; }
 .btn-lg     { padding: 10px 24px; font-size: 14px; }
 
 .error-msg {

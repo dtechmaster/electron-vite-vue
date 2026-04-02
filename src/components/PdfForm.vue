@@ -929,9 +929,12 @@ textarea.pdf-input {
 }
 
 /* Preview: transparent fields, no borders — simulates print output */
-.preview .pdf-input {
+.preview .pdf-input,
+.preview .pdf-input:focus,
+.preview .pdf-input.field-active {
   background: transparent !important;
   border: none !important;
+  outline: none !important;
   box-shadow: none !important;
   pointer-events: none;
 }

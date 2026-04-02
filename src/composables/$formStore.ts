@@ -1,12 +1,13 @@
-// Field positions and styles persist in localStorage (app-wide, not per-file)
-// Form data is now persisted per-file via IPC (electron/main/index.ts)
+// Field positions, styles, and definitions persist in localStorage (app-wide, not per-file)
+// Form data is persisted per-file via IPC (electron/main/index.ts)
 
 // #region Imports
-import type { IFieldPos, IFieldStyle } from '../types'
+import type { IField, IFieldPos, IFieldStyle } from '../types'
 // #endregion
 
-const POS_KEY   = 'idobk_positions'
-const STYLE_KEY = 'idobk_styles'
+const POS_KEY    = 'idobk_positions'
+const STYLE_KEY  = 'idobk_styles'
+const FIELDS_KEY = 'idobk_fields'
 
 // #region $formStore composable
 const $formStore = {
@@ -20,6 +21,12 @@ const $formStore = {
   savePosition(id: string, pos: IFieldPos): void {
     const positions = this.loadPositions()
     positions[id] = pos
+    localStorage.setItem(POS_KEY, JSON.stringify(positions))
+  },
+
+  deletePosition(id: string): void {
+    const positions = this.loadPositions()
+    delete positions[id]
     localStorage.setItem(POS_KEY, JSON.stringify(positions))
   },
 
@@ -48,6 +55,17 @@ const $formStore = {
 
   clearStyles(): void {
     localStorage.removeItem(STYLE_KEY)
+  },
+  // #endregion
+
+  // #region Fields
+  loadFields(): IField[] {
+    try { return JSON.parse(localStorage.getItem(FIELDS_KEY) || '[]') }
+    catch { return [] }
+  },
+
+  saveFields(fields: IField[]): void {
+    localStorage.setItem(FIELDS_KEY, JSON.stringify(fields))
   },
   // #endregion
 

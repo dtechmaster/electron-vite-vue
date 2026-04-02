@@ -74,6 +74,11 @@ function toggleMoveMode(): void {
   pdfFormRef.value.calibrateMode = !pdfFormRef.value.calibrateMode
 }
 //#endregion
+
+//#region Field management
+function addField(): void    { pdfFormRef.value?.addField() }
+function detectFields(): void { pdfFormRef.value?.detectAnnotations() }
+//#endregion
 </script>
 
 <template>
@@ -84,6 +89,16 @@ function toggleMoveMode(): void {
       <span class="app-title">異動届出書 入力ツール</span>
       <div class="btn-group">
         <button class="btn btn-blue" @click="openPDF">🗂 PDF を開く</button>
+        <button
+          v-if="currentFile"
+          class="btn btn-outline"
+          @click="detectFields"
+        >🔍 フィールド検出</button>
+        <button
+          v-if="currentFile"
+          class="btn btn-outline"
+          @click="addField"
+        >＋ フィールド追加</button>
         <button
           v-if="currentFile"
           class="btn"

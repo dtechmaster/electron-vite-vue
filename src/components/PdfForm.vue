@@ -2,7 +2,6 @@
 //#region Imports
 import { ref, reactive, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import * as pdfjsLib from 'pdfjs-dist'
-import $fields from '../composables/$fields'
 import $formStore from '../composables/$formStore'
 import type { IField, IFieldPos, IFieldStyle } from '../types'
 //#endregion
@@ -35,14 +34,19 @@ const calibrateMode = ref(false)
 const mouseCoords   = ref('—')
 const selectedField = ref('—')
 
+const fields         = ref<IField[]>($formStore.loadFields())
 const savedPositions = ref<Record<string, IFieldPos>>($formStore.loadPositions())
 const savedStyles    = ref<Record<string, IFieldStyle>>($formStore.loadStyles())
 
 const activeFieldId = ref<string | null>(null)
 const toolbarPos    = ref({ top: 0, left: 0 })
 
+function blankFormData(): Record<string, string | boolean> {
+  return Object.fromEntries(fields.value.map(f => [f.id, f.type === 'checkbox' ? false : '']))
+}
+
 const formData = reactive<Record<string, string | boolean>>({
-  ...$fields.initial(),
+  ...blankFormData(),
   ...props.initialFormData,
 })
 //#endregion
@@ -125,7 +129,7 @@ watch(
     historyIndex.value  = -1
     calibrateMode.value = false
     activeFieldId.value = null
-    Object.assign(formData, $fields.initial(), props.initialFormData)
+    Object.assign(formData, blankFormData(), props.initialFormData)
     nextTick(pushHistory)
   },
   { immediate: true }
@@ -134,7 +138,7 @@ watch(
 
 //#region Computed — merge saved positions into field definitions
 const resolvedFields = computed(() =>
-  $fields.list.map(f => {
+  fields.value.map(f => {
     const saved = savedPositions.value[f.id]
     return saved ? { ...f, ...saved } : f
   })
@@ -320,6 +324,49 @@ function resetPositions(): void {
 }
 //#endregion
 
+//#region Add / Remove fields
+let _fieldSeq = 0
+
+function addField(): void {
+  const id = `field_${Date.now()}_${++_fieldSeq}`
+  const newField: IField = {
+    id,
+    label:  'フィールド',
+    type:   'text',
+    left:   '10%',
+    top:    '10%',
+    width:  '15%',
+    height: '2.5%',
+    size:   '11px',
+  }
+  fields.value = [...fields.value, newField]
+  $formStore.saveFields(fields.value)
+  formData[id] = ''
+  // Auto-enter calibrate mode so the new field is immediately moveable
+  calibrateMode.value = true
+}
+
+function removeField(id: string): void {
+  fields.value = fields.value.filter(f => f.id !== id)
+  $formStore.saveFields(fields.value)
+  delete formData[id]
+  const pos = { ...savedPositions.value }; delete pos[id]; savedPositions.value = pos
+  const sty = { ...savedStyles.value };    delete sty[id]; savedStyles.value    = sty
+  $formStore.deletePosition(id)
+  $formStore.deleteStyle(id)
+  if (activeFieldId.value === id) activeFieldId.value = null
+}
+
+function getRemoveButtonStyle(field: IField): Record<string, string> {
+  const saved = savedPositions.value[field.id]
+  const w = saved?.width ?? field.width ?? '16px'
+  return {
+    left: `calc(${field.left} + ${w} - 8px)`,
+    top:  `calc(${field.top} - 8px)`,
+  }
+}
+//#endregion
+
 //#region Annotation Detection
 interface IDetectedField {
   fieldName: string
@@ -365,7 +412,7 @@ async function detectAnnotations(): Promise<void> {
 
       // Try to match to a known field ID
       const name      = (a.fieldName ?? a.id ?? '') as string
-      const matchedId = $fields.find(name) ? name : null
+      const matchedId = fields.value.find(f => f.id === name) ? name : null
 
       return { fieldName: name, fieldType: a.fieldType ?? '?', left, top, width, height, matchedId }
     })
@@ -456,7 +503,7 @@ function resetFieldStyle(): void {
 //#endregion
 
 // Expose for parent (print)
-defineExpose({ calibrateMode, resetPositions, detectAnnotations })
+defineExpose({ calibrateMode, resetPositions, detectAnnotations, addField })
 </script>
 
 <template>
@@ -474,7 +521,6 @@ defineExpose({ calibrateMode, resetPositions, detectAnnotations })
       <code>{{ mouseCoords }}</code>
       <span v-if="selectedField !== '—'"> | <code>{{ selectedField }}</code></span>
       &nbsp;·&nbsp;<kbd>ESC</kbd> で終了
-      <button class="btn-detect" @click="detectAnnotations">🔍 フィールド検出</button>
       <button class="btn-reset-pos" @click="resetPositions">↺ 位置リセット</button>
     </div>
   </Transition>
@@ -600,7 +646,7 @@ defineExpose({ calibrateMode, resetPositions, detectAnnotations })
       </template>
       <!--#endregion-->
 
-      <!--#region Resize Handles (calibration mode only) -->
+      <!--#region Resize Handles & Remove Buttons (calibration mode only) -->
       <template v-if="calibrateMode">
         <div
           v-for="field in resizableFields"
@@ -609,6 +655,14 @@ defineExpose({ calibrateMode, resetPositions, detectAnnotations })
           :style="getResizeHandleStyle(field)"
           @mousedown.stop="onResizeMouseDown($event, field)"
         />
+        <button
+          v-for="field in resolvedFields"
+          :key="'x-' + field.id"
+          class="field-remove"
+          :style="getRemoveButtonStyle(field)"
+          @mousedown.stop
+          @click.stop="removeField(field.id)"
+        >✕</button>
       </template>
       <!--#endregion-->
 
@@ -712,18 +766,6 @@ defineExpose({ calibrateMode, resetPositions, detectAnnotations })
   font-size: 11px;
   font-family: monospace;
 }
-
-.btn-detect {
-  padding: 2px 10px;
-  border: 1px solid #89b4fa;
-  border-radius: 4px;
-  background: transparent;
-  color: #89b4fa;
-  font-size: 11px;
-  cursor: pointer;
-  transition: background 0.12s;
-}
-.btn-detect:hover { background: rgba(137,180,250,0.15); }
 
 .btn-reset-pos {
   margin-left: auto;
@@ -901,6 +943,28 @@ textarea.pdf-input {
   cursor: grab !important;
 }
 .calibrate .pdf-input:active { cursor: grabbing !important; }
+
+/* Field remove button */
+.field-remove {
+  position: absolute;
+  z-index: 90;
+  width: 16px;
+  height: 16px;
+  background: #f38ba8;
+  border: 1px solid #1e1e2e;
+  border-radius: 50%;
+  color: #1e1e2e;
+  font-size: 8px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  transition: background 0.1s;
+}
+.field-remove:hover { background: #fe640b; }
 
 /* Resize handle */
 .resize-handle {

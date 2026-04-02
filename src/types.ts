@@ -14,13 +14,10 @@ export const TField = z.object({
   top:         z.string(),
   width:       z.string().optional(),
   height:      z.string().optional(),
-  /** CSS font-size value, e.g. '10px' */
   size:        z.string().optional(),
   max:         z.number().int().positive().optional(),
   placeholder: z.string().optional(),
-  /** Extra inline CSS properties, e.g. { textAlign: 'center' } */
   xstyle:      z.record(z.string()).optional(),
-  /** Group identifier for special behaviors, e.g. 'hojin_bangou' for auto-advance */
   group:       z.string().optional(),
 })
 export type IField = z.infer<typeof TField>

@@ -1,167 +1,191 @@
 <script setup lang="ts">
 //#region Imports
-import { ref, reactive, computed, watch, onMounted } from 'vue'
+import { ref, reactive, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import * as pdfjsLib from 'pdfjs-dist'
 import $fields from '../composables/$fields'
 import $formStore from '../composables/$formStore'
 import type { IField, IFieldPos } from '../types'
 //#endregion
 
+//#region Props & Emits
+interface Props {
+  filePath:        string
+  pdfBuffer:       ArrayBuffer
+  initialFormData: Record<string, string | boolean>
+}
+const props = defineProps<Props>()
+const emit  = defineEmits<{
+  /** Fired (debounced) whenever any field changes — parent persists to disk */
+  save: [data: Record<string, string | boolean>]
+}>()
+//#endregion
+
 //#region PDF.js Worker
-// Served from public/pdf.worker.mjs (copied by vite.config.ts)
 pdfjsLib.GlobalWorkerOptions.workerSrc = './pdf.worker.mjs'
 //#endregion
 
 //#region State
-const isLoaded       = ref(false)
-const pdfImgSrc      = ref('')
-const containerRef   = ref<HTMLDivElement | null>(null)
-const containerH     = ref(0)
-const calibrateMode  = ref(false)
-const mouseCoords    = ref('—')
-const selectedField  = ref('—')
+const isLoaded      = ref(false)
+const pdfImgSrc     = ref('')
+const containerRef  = ref<HTMLDivElement | null>(null)
+const containerH    = ref(0)
+const calibrateMode = ref(false)
+const mouseCoords   = ref('—')
+const selectedField = ref('—')
+
 const savedPositions = ref<Record<string, IFieldPos>>($formStore.loadPositions())
 
 const formData = reactive<Record<string, string | boolean>>({
   ...$fields.initial(),
-  ...$formStore.loadData(),
+  ...props.initialFormData,
 })
 //#endregion
 
-//#region Computed — resolved fields (merge saved positions with defaults)
-const resolvedFields = computed(() =>
-  $fields.list.map(f => ({
-    ...f,
-    ...(savedPositions.value[f.id] ?? {}),
-  }))
+//#region Undo / Redo
+const MAX_HISTORY = 100
+const history      = ref<Record<string, string | boolean>[]>([])
+const historyIndex = ref(-1)
+
+function pushHistory(): void {
+  history.value = history.value.slice(0, historyIndex.value + 1)
+  history.value.push({ ...formData })
+  if (history.value.length > MAX_HISTORY) history.value.shift()
+  else historyIndex.value++
+}
+
+function applyHistory(snapshot: Record<string, string | boolean>): void {
+  Object.assign(formData, snapshot)
+  scheduleSave()
+}
+
+function undo(): void {
+  if (historyIndex.value <= 0) return
+  historyIndex.value--
+  applyHistory(history.value[historyIndex.value])
+}
+
+function redo(): void {
+  if (historyIndex.value >= history.value.length - 1) return
+  historyIndex.value++
+  applyHistory(history.value[historyIndex.value])
+}
+//#endregion
+
+//#region Auto-save (debounced)
+let saveTimer: ReturnType<typeof setTimeout> | null = null
+
+function scheduleSave(): void {
+  if (saveTimer) clearTimeout(saveTimer)
+  saveTimer = setTimeout(() => emit('save', { ...formData }), 800)
+}
+//#endregion
+
+//#region PDF Rendering
+async function renderPDF(buffer: ArrayBuffer): Promise<void> {
+  isLoaded.value = false
+  pdfImgSrc.value = ''
+
+  const pdf      = await pdfjsLib.getDocument({ data: new Uint8Array(buffer) }).promise
+  const page     = await pdf.getPage(1)
+  const viewport = page.getViewport({ scale: 2.0 })
+  const canvas   = document.createElement('canvas')
+  canvas.width   = viewport.width
+  canvas.height  = viewport.height
+
+  await page.render({ canvasContext: canvas.getContext('2d')!, viewport }).promise
+
+  pdfImgSrc.value = canvas.toDataURL('image/png')
+  isLoaded.value  = true
+}
+
+// Re-render whenever the PDF buffer changes (file switch)
+watch(() => props.pdfBuffer, buf => { if (buf) renderPDF(buf) }, { immediate: true })
+//#endregion
+
+//#region Reset when file changes
+watch(
+  () => props.filePath,
+  () => {
+    history.value      = []
+    historyIndex.value = -1
+    calibrateMode.value = false
+    Object.assign(formData, $fields.initial(), props.initialFormData)
+    nextTick(pushHistory)
+  },
+  { immediate: true }
 )
 //#endregion
 
-//#region Auto-save on every change (debounced)
-let saveTimer: ReturnType<typeof setTimeout> | null = null
-
-watch(formData, () => {
-  if (saveTimer) clearTimeout(saveTimer)
-  saveTimer = setTimeout(() => {
-    $formStore.saveData({ ...formData })
-  }, 400)
-}, { deep: true })
-//#endregion
-
-//#region Init — load PDF via IPC, render to canvas, convert to img
-onMounted(async () => {
-  try {
-    const buffer = await window.electronAPI.readPDF()
-    const pdf    = await pdfjsLib.getDocument({ data: buffer }).promise
-    const page   = await pdf.getPage(1)
-
-    const scale   = 2.0 // 2× for sharpness
-    const viewport = page.getViewport({ scale })
-    const canvas  = document.createElement('canvas')
-    canvas.width  = viewport.width
-    canvas.height = viewport.height
-
-    await page.render({
-      canvasContext: canvas.getContext('2d')!,
-      viewport,
-    }).promise
-
-    pdfImgSrc.value = canvas.toDataURL('image/png')
-    isLoaded.value  = true
-  } catch (err) {
-    console.error('Failed to load PDF:', err)
-  }
-})
-
-function onImgLoad(e: Event) {
-  const img = e.target as HTMLImageElement
-  const ratio = img.naturalHeight / img.naturalWidth
-  containerH.value = img.offsetWidth * ratio
-}
-//#endregion
-
-//#region Field Style
-function getStyle(field: IField): Record<string, string> {
-  const style: Record<string, string> = {
-    left: field.left,
-    top:  field.top,
-  }
-  if (field.type !== 'checkbox') {
-    if (field.width)  style.width  = field.width
-    if (field.height) style.height = field.height
-  }
-  if (field.size) style.fontSize = field.size
-  if (field.xstyle) Object.assign(style, field.xstyle)
-  return style
-}
+//#region Computed — merge saved positions into field definitions
+const resolvedFields = computed(() =>
+  $fields.list.map(f => {
+    const saved = savedPositions.value[f.id]
+    return saved ? { ...f, ...saved } : f
+  })
+)
 //#endregion
 
 //#region Input Handlers
-function onTextInput(e: Event, id: string) {
-  formData[id] = (e.target as HTMLInputElement | HTMLTextAreaElement).value
+function onTextInput(e: Event, field: IField): void {
+  formData[field.id] = (e.target as HTMLInputElement | HTMLTextAreaElement).value
+  pushHistory()
+  scheduleSave()
 }
 
-function onCheckboxChange(e: Event, id: string) {
+function onCheckboxChange(e: Event, id: string): void {
   formData[id] = (e.target as HTMLInputElement).checked
+  pushHistory()
+  scheduleSave()
 }
 
-function onKeyDown(e: KeyboardEvent, field: IField) {
+function onKeyDown(e: KeyboardEvent, field: IField): void {
   if (field.group !== 'hojin_bangou') return
   const idx = parseInt(field.id.split('_')[2])
-
   if (e.key === 'Backspace' && (formData[field.id] as string) === '' && idx > 0) {
-    e.preventDefault()
-    focusBangouCell(idx - 1)
+    e.preventDefault(); focusBangouCell(idx - 1)
   }
   if (e.key === 'ArrowLeft'  && idx > 0)  { e.preventDefault(); focusBangouCell(idx - 1) }
   if (e.key === 'ArrowRight' && idx < 12) { e.preventDefault(); focusBangouCell(idx + 1) }
 }
 
-function onTextInputForAutoAdvance(e: Event, field: IField) {
-  onTextInput(e, field.id)
-  if (field.group === 'hojin_bangou') {
-    const val = (e.target as HTMLInputElement).value
-    if (val.length >= 1) {
-      const idx = parseInt(field.id.split('_')[2])
-      if (idx < 12) focusBangouCell(idx + 1)
-    }
+function onTextInputAutoAdvance(e: Event, field: IField): void {
+  onTextInput(e, field)
+  if (field.group === 'hojin_bangou' && (formData[field.id] as string).length >= 1) {
+    const idx = parseInt(field.id.split('_')[2])
+    if (idx < 12) focusBangouCell(idx + 1)
   }
 }
 
-function focusBangouCell(idx: number) {
+function focusBangouCell(idx: number): void {
   const el = document.getElementById(`hojin_num_${idx}`) as HTMLInputElement | null
-  el?.focus()
-  el?.select()
+  el?.focus(); el?.select()
 }
 //#endregion
 
-//#region Calibration Drag
-function onMouseDown(e: MouseEvent, field: IField) {
+//#region Calibration — Ctrl+Click to enter, ESC to exit, drag to reposition
+function onFieldMouseDown(e: MouseEvent, field: IField): void {
+  // Ctrl+Click → enter calibration mode
+  if (e.ctrlKey && !calibrateMode.value) {
+    e.preventDefault()
+    calibrateMode.value = true
+  }
+
   if (!calibrateMode.value) return
   e.preventDefault()
-  e.stopPropagation()
 
   const container = containerRef.value!
   const cr        = container.getBoundingClientRect()
   const startX    = e.clientX
   const startY    = e.clientY
-  const startL    = parseFloat(field.left)
-  const startT    = parseFloat(field.top)
+  const startL    = parseFloat((savedPositions.value[field.id]?.left ?? field.left))
+  const startT    = parseFloat((savedPositions.value[field.id]?.top  ?? field.top))
 
   function onMove(e: MouseEvent) {
-    const dx   = (e.clientX - startX) / cr.width  * 100
-    const dy   = (e.clientY - startY) / cr.height * 100
-    const left = (startL + dx).toFixed(2) + '%'
-    const top  = (startT + dy).toFixed(2) + '%'
-
-    // Update local state so Vue re-renders
+    const left = (startL + (e.clientX - startX) / cr.width  * 100).toFixed(2) + '%'
+    const top  = (startT + (e.clientY - startY) / cr.height * 100).toFixed(2) + '%'
     savedPositions.value = {
       ...savedPositions.value,
-      [field.id]: {
-        ...(savedPositions.value[field.id] ?? {}),
-        left,
-        top,
-      },
+      [field.id]: { ...(savedPositions.value[field.id] ?? {}), left, top },
     }
     selectedField.value = `[${field.id}]  left: ${left}  top: ${top}`
   }
@@ -177,79 +201,81 @@ function onMouseDown(e: MouseEvent, field: IField) {
   document.addEventListener('mouseup',   onUp)
 }
 
-function onContainerMouseMove(e: MouseEvent) {
+function onContainerMouseMove(e: MouseEvent): void {
   if (!calibrateMode.value) return
-  const rect = containerRef.value!.getBoundingClientRect()
-  const x    = ((e.clientX - rect.left) / rect.width  * 100).toFixed(1)
-  const y    = ((e.clientY - rect.top)  / rect.height * 100).toFixed(1)
-  mouseCoords.value = `${x}%,  ${y}%`
+  const r = containerRef.value!.getBoundingClientRect()
+  mouseCoords.value = `${((e.clientX - r.left) / r.width * 100).toFixed(1)}%,  ${((e.clientY - r.top) / r.height * 100).toFixed(1)}%`
+}
+
+function onImgLoad(e: Event): void {
+  const img   = e.target as HTMLImageElement
+  const ratio = img.naturalHeight / img.naturalWidth
+  containerH.value = img.offsetWidth * ratio
 }
 //#endregion
 
-//#region Controls
-function toggleCalibrate() {
-  calibrateMode.value = !calibrateMode.value
-  selectedField.value = '—'
-  mouseCoords.value   = '—'
+//#region Global Keyboard Shortcuts
+function onGlobalKeyDown(e: KeyboardEvent): void {
+  if (e.ctrlKey && e.key === 'z') { e.preventDefault(); undo() }
+  if (e.ctrlKey && e.key === 'y') { e.preventDefault(); redo() }
+  if (e.key === 'Escape' && calibrateMode.value) {
+    calibrateMode.value = false
+    selectedField.value = '—'
+    mouseCoords.value   = '—'
+  }
 }
 
-function resetPositions() {
+onMounted(() => window.addEventListener('keydown', onGlobalKeyDown))
+onUnmounted(() => window.removeEventListener('keydown', onGlobalKeyDown))
+//#endregion
+
+//#region Field Style helper
+function getStyle(field: IField): Record<string, string> {
+  const style: Record<string, string> = {
+    left: field.left,
+    top:  field.top,
+  }
+  if (field.type !== 'checkbox') {
+    if (field.width)  style.width  = field.width
+    if (field.height) style.height = field.height
+  }
+  if (field.size)   style.fontSize = field.size
+  if (field.xstyle) Object.assign(style, field.xstyle)
+  return style
+}
+//#endregion
+
+//#region Reset positions
+function resetPositions(): void {
   if (!confirm('フィールドの位置をデフォルトにリセットしますか？')) return
   $formStore.clearPositions()
   savedPositions.value = {}
 }
-
-function clearForm() {
-  if (!confirm('入力内容をすべてクリアしますか？')) return
-  Object.assign(formData, $fields.initial())
-  $formStore.clearData()
-}
-
-async function saveToFile() {
-  const json   = JSON.stringify({ ...formData }, null, 2)
-  const result = await window.electronAPI.saveData(json)
-  if (!result.success) console.log('Save cancelled')
-}
-
-async function loadFromFile() {
-  const result = await window.electronAPI.loadData()
-  if (!result.success || !result.data) return
-  try {
-    const data = JSON.parse(result.data) as Record<string, string | boolean>
-    Object.assign(formData, data)
-  } catch (err) {
-    console.error('Failed to parse JSON:', err)
-    alert('ファイルの読み込みに失敗しました。')
-  }
-}
-
-function printForm() {
-  window.electronAPI.print()
-}
 //#endregion
+
+// Expose for parent (print)
+defineExpose({ calibrateMode, resetPositions })
 </script>
 
 <template>
-  <!--#region Controls Bar -->
-  <div id="controls">
-    <span class="app-title">異動届出書 入力ツール</span>
-    <div class="btn-group">
-      <button class="btn btn-blue"      @click="saveToFile">💾 保存</button>
-      <button class="btn btn-purple"    @click="loadFromFile">📂 読込</button>
-      <button class="btn btn-orange"    @click="toggleCalibrate">
-        {{ calibrateMode ? '✅ 完了' : '🎯 位置調整' }}
-      </button>
-      <button class="btn btn-muted"     @click="resetPositions">↺ 位置リセット</button>
-      <button class="btn btn-red"       @click="clearForm">🗑 クリア</button>
-      <button class="btn btn-green"     @click="printForm">🖨 印刷</button>
-    </div>
-  </div>
+  <!--#region Loading -->
+  <div v-if="!isLoaded" class="loading-msg">PDFを読み込み中...</div>
   <!--#endregion-->
 
-  <!--#region Form Area -->
-  <div class="form-wrapper">
-    <div v-if="!isLoaded" class="loading-msg">PDFを読み込み中...</div>
+  <!--#region Calibration Banner -->
+  <Transition name="banner">
+    <div v-if="calibrateMode" class="calibrate-banner">
+      🎯 位置調整モード —
+      <code>{{ mouseCoords }}</code>
+      <span v-if="selectedField !== '—'"> | <code>{{ selectedField }}</code></span>
+      &nbsp;·&nbsp;<kbd>ESC</kbd> で終了
+      <button class="btn-reset-pos" @click="resetPositions">↺ 位置リセット</button>
+    </div>
+  </Transition>
+  <!--#endregion-->
 
+  <!--#region PDF Form -->
+  <div class="form-scroll">
     <div
       ref="containerRef"
       class="form-container"
@@ -265,8 +291,9 @@ function printForm() {
         @load="onImgLoad"
       >
 
-      <!--#region Dynamic Inputs -->
+      <!--#region Inputs -->
       <template v-for="field in resolvedFields" :key="field.id">
+
         <!-- Textarea -->
         <textarea
           v-if="field.type === 'textarea'"
@@ -274,10 +301,9 @@ function printForm() {
           class="pdf-input"
           :style="getStyle(field)"
           :title="field.label"
-          :data-field-id="field.id"
           :value="(formData[field.id] as string) ?? ''"
-          @input="onTextInput($event, field.id)"
-          @mousedown="onMouseDown($event, field)"
+          @input="onTextInput($event, field)"
+          @mousedown="onFieldMouseDown($event, field)"
         />
 
         <!-- Checkbox -->
@@ -288,13 +314,12 @@ function printForm() {
           type="checkbox"
           :style="getStyle(field)"
           :title="field.label"
-          :data-field-id="field.id"
           :checked="(formData[field.id] as boolean) ?? false"
           @change="onCheckboxChange($event, field.id)"
-          @mousedown="onMouseDown($event, field)"
+          @mousedown="onFieldMouseDown($event, field)"
         />
 
-        <!-- Text input -->
+        <!-- Text -->
         <input
           v-else
           :id="field.id"
@@ -302,96 +327,99 @@ function printForm() {
           type="text"
           :style="getStyle(field)"
           :title="field.label"
-          :data-field-id="field.id"
           :maxlength="field.max ?? undefined"
           :placeholder="field.placeholder ?? ''"
           :value="(formData[field.id] as string) ?? ''"
-          @input="onTextInputForAutoAdvance($event, field)"
+          @input="onTextInputAutoAdvance($event, field)"
           @keydown="onKeyDown($event, field)"
-          @mousedown="onMouseDown($event, field)"
+          @mousedown="onFieldMouseDown($event, field)"
         />
+
       </template>
       <!--#endregion-->
     </div>
   </div>
   <!--#endregion-->
-
-  <!--#region Calibration Info Panel -->
-  <Transition name="fade">
-    <div v-if="calibrateMode" class="calibrate-panel">
-      <b>🎯 位置調整モード</b><br>
-      マウス: <code>{{ mouseCoords }}</code><br>
-      選択中: <code>{{ selectedField }}</code><br>
-      <small>フィールドをドラッグして移動</small>
-    </div>
-  </Transition>
-  <!--#endregion-->
 </template>
 
 <style scoped>
-/*#region Controls */
-#controls {
+/*#region Loading */
+.loading-msg {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  color: #6c7086;
+  font-size: 14px;
+}
+/*#endregion*/
+
+/*#region Calibration Banner */
+.calibrate-banner {
   position: sticky;
   top: 0;
-  z-index: 100;
-  background: #11111b;
-  border-bottom: 1px solid #313244;
-  padding: 8px 16px;
+  z-index: 200;
+  background: #2d1b00;
+  border-bottom: 1px solid #fab387;
+  color: #fab387;
+  font-size: 12px;
+  padding: 5px 16px;
   display: flex;
   align-items: center;
   gap: 8px;
-  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.4);
+  flex-shrink: 0;
 }
 
-.app-title {
-  font-size: 13px;
-  font-weight: 700;
+.calibrate-banner code {
+  color: #89dceb;
+  font-size: 11px;
+  font-family: monospace;
+}
+
+.calibrate-banner kbd {
+  background: #45475a;
   color: #cdd6f4;
-  flex: 1;
-  letter-spacing: 0.02em;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 11px;
+  font-family: monospace;
 }
 
-.btn-group { display: flex; gap: 6px; flex-shrink: 0; }
-
-.btn {
-  padding: 5px 13px;
-  border: none;
-  border-radius: 5px;
-  font-size: 12px;
-  font-weight: 700;
+.btn-reset-pos {
+  margin-left: auto;
+  padding: 2px 10px;
+  border: 1px solid #fab387;
+  border-radius: 4px;
+  background: transparent;
+  color: #fab387;
+  font-size: 11px;
   cursor: pointer;
-  transition: opacity 0.12s, transform 0.08s;
-  white-space: nowrap;
+  transition: background 0.12s;
 }
-.btn:hover  { opacity: 0.85; }
-.btn:active { transform: scale(0.97); }
+.btn-reset-pos:hover { background: rgba(250,179,135,0.15); }
 
-.btn-green  { background: #a6e3a1; color: #1e1e2e; }
-.btn-red    { background: #f38ba8; color: #1e1e2e; }
-.btn-orange { background: #fab387; color: #1e1e2e; }
-.btn-blue   { background: #89b4fa; color: #1e1e2e; }
-.btn-purple { background: #b4befe; color: #1e1e2e; }
-.btn-muted  { background: #45475a; color: #cdd6f4; }
+.banner-enter-active, .banner-leave-active { transition: opacity 0.15s, transform 0.15s; }
+.banner-enter-from, .banner-leave-to { opacity: 0; transform: translateY(-4px); }
 /*#endregion*/
 
-/*#region Form Wrapper */
-.form-wrapper {
+/*#region Form Scroll */
+.form-scroll {
+  flex: 1;
+  overflow: auto;
   display: flex;
-  justify-content: center;
+  flex-direction: column;
+  align-items: center;
   padding: 20px 20px 40px;
 }
+/*#endregion*/
 
-.loading-msg {
-  color: #6c7086;
-  padding: 40px;
-  font-size: 14px;
-}
-
+/*#region Form Container */
 .form-container {
   position: relative;
   display: inline-block;
   box-shadow: 0 8px 40px rgba(0, 0, 0, 0.6);
   line-height: 0;
+  flex-shrink: 0;
 }
 
 .pdf-img {
@@ -439,52 +467,22 @@ textarea.pdf-input {
   overflow: hidden;
 }
 
-/* Calibration mode: inputs are red and grabbable */
+/* Calibration: red + grab cursor */
 .calibrate .pdf-input {
   background: rgba(255, 80, 80, 0.18) !important;
   border: 1.5px solid rgba(255, 60, 60, 0.7) !important;
   cursor: grab !important;
 }
 .calibrate .pdf-input:active { cursor: grabbing !important; }
-/*#endregion*/
 
-/*#region Calibration Panel */
-.calibrate-panel {
-  position: fixed;
-  bottom: 12px;
-  right: 12px;
-  background: rgba(0, 0, 0, 0.88);
-  color: #a6e3a1;
-  padding: 10px 14px;
-  border-radius: 8px;
-  font-size: 11px;
-  line-height: 1.8;
-  z-index: 9999;
-  min-width: 280px;
-  border: 1px solid #313244;
-}
-
-.calibrate-panel code {
-  color: #89dceb;
-  font-size: 11px;
-}
-
-.calibrate-panel small { color: #6c7086; }
-
-.fade-enter-active, .fade-leave-active { transition: opacity 0.2s; }
-.fade-enter-from, .fade-leave-to { opacity: 0; }
+/* Ctrl held: show grab cursor as hint even before calibrate mode */
+:global(body.ctrl-held) .pdf-input { cursor: crosshair !important; }
 /*#endregion*/
 
 /*#region Print */
 @media print {
-  @page { size: A4 portrait; margin: 0; }
-
-  #controls { display: none !important; }
-
-  .form-wrapper {
-    padding: 0;
-    display: block;
-  }
+  .calibrate-banner { display: none !important; }
+  .form-scroll { padding: 0; display: block; }
 
   .form-container {
     width: 210mm !important;
@@ -518,8 +516,6 @@ textarea.pdf-input {
     appearance: checkbox;
     color-scheme: light;
   }
-
-  .calibrate-panel { display: none !important; }
 }
 /*#endregion*/
 </style>

@@ -21,25 +21,52 @@ process.env.VITE_PUBLIC = VITE_DEV_SERVER_URL
   : RENDERER_DIST
 
 if (os.release().startsWith('6.1')) app.disableHardwareAcceleration()
-if (process.platform === 'win32') app.setAppUserModelId(app.getName())
+if (process.platform === 'win32')   app.setAppUserModelId(app.getName())
 
 if (!app.requestSingleInstanceLock()) {
   app.quit()
   process.exit(0)
 }
 
+// #region Store helpers
+interface IStoredFile {
+  filePath:    string
+  fileName:    string
+  lastOpened:  string
+  lastSaved?:  string
+  formData:    Record<string, string | boolean>
+}
+interface IFormsStore {
+  version: number
+  files:   Record<string, IStoredFile>
+}
+
+function getStoreFile(): string {
+  return path.join(app.getPath('userData'), 'forms.json')
+}
+
+function readStore(): IFormsStore {
+  try { return JSON.parse(fs.readFileSync(getStoreFile(), 'utf-8')) }
+  catch { return { version: 1, files: {} } }
+}
+
+function writeStore(store: IFormsStore): void {
+  fs.writeFileSync(getStoreFile(), JSON.stringify(store, null, 2), 'utf-8')
+}
+// #endregion
+
 // #region Window
 let win: BrowserWindow | null = null
-const preload  = path.join(__dirname, '../preload/index.mjs')
+const preload   = path.join(__dirname, '../preload/index.mjs')
 const indexHtml = path.join(RENDERER_DIST, 'index.html')
 
 async function createWindow() {
   win = new BrowserWindow({
-    title:           '異動届出書 入力ツール',
-    width:           900,
-    height:          920,
-    minWidth:        860,
-    minHeight:       600,
+    title:  '異動届出書 入力ツール',
+    width:  1120,
+    height: 920,
+    minWidth:  860,
+    minHeight: 600,
     webPreferences: {
       preload,
       contextIsolation: true,
@@ -65,51 +92,109 @@ async function createWindow() {
 }
 // #endregion
 
-// #region IPC — PDF
-ipcMain.handle('read-pdf', async () => {
-  const pdfPath = path.join(process.env.VITE_PUBLIC!, 'form.pdf')
-  return await fs.promises.readFile(pdfPath)
+// #region IPC — Open PDF (file dialog)
+ipcMain.handle('open-pdf', async () => {
+  const result = await dialog.showOpenDialog(win!, {
+    title:   'PDFファイルを開く',
+    filters: [{ name: 'PDF', extensions: ['pdf'] }],
+    properties: ['openFile'],
+  })
+  if (result.canceled || !result.filePaths[0]) return null
+
+  const filePath = result.filePaths[0]
+  let pdfData: Buffer
+  try {
+    pdfData = await fs.promises.readFile(filePath)
+  } catch {
+    return { error: 'read_failed' }
+  }
+
+  const store = readStore()
+  if (!store.files[filePath]) {
+    store.files[filePath] = {
+      filePath,
+      fileName:   path.basename(filePath),
+      lastOpened: new Date().toISOString(),
+      formData:   {},
+    }
+  } else {
+    store.files[filePath].lastOpened = new Date().toISOString()
+  }
+  writeStore(store)
+
+  return {
+    filePath,
+    fileName: store.files[filePath].fileName,
+    pdfData,
+    formData: store.files[filePath].formData,
+  }
+})
+// #endregion
+
+// #region IPC — Get file list
+ipcMain.handle('get-files', () => {
+  const store = readStore()
+  return Object.values(store.files)
+    .map(({ filePath, fileName, lastOpened, lastSaved }) => ({
+      filePath,
+      fileName,
+      lastOpened,
+      lastSaved,
+      exists: fs.existsSync(filePath),
+    }))
+    .sort((a, b) => new Date(b.lastOpened).getTime() - new Date(a.lastOpened).getTime())
+})
+// #endregion
+
+// #region IPC — Load a specific registered PDF
+ipcMain.handle('load-pdf-file', async (_event, filePath: string) => {
+  const store = readStore()
+  const info  = store.files[filePath]
+  if (!info) return null
+
+  let pdfData: Buffer
+  try {
+    pdfData = await fs.promises.readFile(filePath)
+  } catch {
+    return { error: 'read_failed', filePath }
+  }
+
+  store.files[filePath].lastOpened = new Date().toISOString()
+  writeStore(store)
+
+  return {
+    filePath,
+    fileName: info.fileName,
+    pdfData,
+    formData: info.formData,
+  }
+})
+// #endregion
+
+// #region IPC — Auto-save form data
+ipcMain.handle('save-form-data', (_event, filePath: string, formData: Record<string, string | boolean>) => {
+  const store = readStore()
+  if (!store.files[filePath]) return
+  store.files[filePath].formData  = formData
+  store.files[filePath].lastSaved = new Date().toISOString()
+  writeStore(store)
+})
+// #endregion
+
+// #region IPC — Remove file from history
+ipcMain.handle('remove-file', (_event, filePath: string) => {
+  const store = readStore()
+  delete store.files[filePath]
+  writeStore(store)
 })
 // #endregion
 
 // #region IPC — Print
 ipcMain.handle('print', () => {
-  if (!win) return
-  win.webContents.print(
-    {
-      silent: false,
-      printBackground: false,
-      pageSize: 'A4',
-      landscape: false,
-    },
-    (success, errorType) => {
-      if (!success) console.error('Print failed:', errorType)
-    }
+  win?.webContents.print(
+    { silent: false, printBackground: false, pageSize: 'A4', landscape: false },
+    (success, err) => { if (!success) console.error('Print error:', err) }
   )
-})
-// #endregion
-
-// #region IPC — File Save / Load
-ipcMain.handle('save-data', async (_event, jsonString: string) => {
-  const result = await dialog.showSaveDialog(win!, {
-    title: 'データを保存',
-    defaultPath: '異動届出書_データ.json',
-    filters: [{ name: 'JSON', extensions: ['json'] }],
-  })
-  if (result.canceled || !result.filePath) return { success: false }
-  await fs.promises.writeFile(result.filePath, jsonString, 'utf-8')
-  return { success: true }
-})
-
-ipcMain.handle('load-data', async () => {
-  const result = await dialog.showOpenDialog(win!, {
-    title: 'データを読み込む',
-    filters: [{ name: 'JSON', extensions: ['json'] }],
-    properties: ['openFile'],
-  })
-  if (result.canceled || !result.filePaths[0]) return { success: false, data: '' }
-  const data = await fs.promises.readFile(result.filePaths[0], 'utf-8')
-  return { success: true, data }
 })
 // #endregion
 

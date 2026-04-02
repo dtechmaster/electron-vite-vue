@@ -247,7 +247,6 @@ function onResizeMouseDown(e: MouseEvent, field: IField): void {
 
 const resizableFields = computed(() =>
   resolvedFields.value.filter(f => {
-    if (f.type === 'checkbox') return false
     const saved = savedPositions.value[f.id]
     return (saved?.width ?? f.width) && (saved?.height ?? f.height)
   })
@@ -298,10 +297,8 @@ function getStyle(field: IField): Record<string, string> {
     left: field.left,
     top:  field.top,
   }
-  if (field.type !== 'checkbox') {
-    if (field.width)  style.width  = field.width
-    if (field.height) style.height = field.height
-  }
+  if (field.width)  style.width  = field.width
+  if (field.height) style.height = field.height
   if (field.size)   style.fontSize = field.size
   if (field.xstyle) Object.assign(style, field.xstyle)
 
@@ -509,6 +506,15 @@ function changeFieldType(newType: IFieldType): void {
   )
   $formStore.saveFields(fields.value)
   formData[id] = (newType === 'checkbox' || newType === 'radio') ? false : ''
+  // Ensure checkbox/radio have a size so the resize handle is available
+  if (newType === 'checkbox' || newType === 'radio') {
+    const existing = savedPositions.value[id]
+    if (!existing?.width || !existing?.height) {
+      const pos = { ...(existing ?? {}), width: '1.8%', height: '2.2%' }
+      savedPositions.value = { ...savedPositions.value, [id]: pos }
+      $formStore.savePosition(id, pos)
+    }
+  }
 }
 //#endregion
 
@@ -951,8 +957,6 @@ defineExpose({ calibrateMode, resetPositions, detectAnnotations, addField })
   border: 1px dashed rgba(100, 160, 255, 0.4);
   padding: 0;
   cursor: pointer;
-  width: 13px !important;
-  height: 13px !important;
   accent-color: #1a40af;
 }
 

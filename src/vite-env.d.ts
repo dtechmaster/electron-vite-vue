@@ -7,6 +7,10 @@ declare module '*.vue' {
 }
 
 interface Window {
-  // expose in the `electron/preload/index.ts`
-  ipcRenderer: import('electron').IpcRenderer
+  electronAPI: {
+    readPDF():              Promise<ArrayBuffer>
+    print():               Promise<void>
+    saveData(json: string): Promise<{ success: boolean }>
+    loadData():            Promise<{ success: boolean; data: string }>
+  }
 }

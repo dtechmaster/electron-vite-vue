@@ -1,25 +1,18 @@
-import { app, BrowserWindow, shell, ipcMain } from 'electron'
+// #region Imports
+import { app, BrowserWindow, shell, ipcMain, dialog } from 'electron'
 import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
+import fs from 'node:fs'
 import os from 'node:os'
+// #endregion
 
 const require = createRequire(import.meta.url)
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
-// The built directory structure
-//
-// ├─┬ dist-electron
-// │ ├─┬ main
-// │ │ └── index.js    > Electron-Main
-// │ └─┬ preload
-// │   └── index.mjs   > Preload-Scripts
-// ├─┬ dist
-// │ └── index.html    > Electron-Renderer
-//
 process.env.APP_ROOT = path.join(__dirname, '../..')
 
-export const MAIN_DIST = path.join(process.env.APP_ROOT, 'dist-electron')
+export const MAIN_DIST     = path.join(process.env.APP_ROOT, 'dist-electron')
 export const RENDERER_DIST = path.join(process.env.APP_ROOT, 'dist')
 export const VITE_DEV_SERVER_URL = process.env.VITE_DEV_SERVER_URL
 
@@ -27,10 +20,7 @@ process.env.VITE_PUBLIC = VITE_DEV_SERVER_URL
   ? path.join(process.env.APP_ROOT, 'public')
   : RENDERER_DIST
 
-// Disable GPU Acceleration for Windows 7
 if (os.release().startsWith('6.1')) app.disableHardwareAcceleration()
-
-// Set application name for Windows 10+ notifications
 if (process.platform === 'win32') app.setAppUserModelId(app.getName())
 
 if (!app.requestSingleInstanceLock()) {
@@ -38,46 +28,92 @@ if (!app.requestSingleInstanceLock()) {
   process.exit(0)
 }
 
+// #region Window
 let win: BrowserWindow | null = null
-const preload = path.join(__dirname, '../preload/index.mjs')
+const preload  = path.join(__dirname, '../preload/index.mjs')
 const indexHtml = path.join(RENDERER_DIST, 'index.html')
 
 async function createWindow() {
   win = new BrowserWindow({
-    title: 'Main window',
-    icon: path.join(process.env.VITE_PUBLIC, 'favicon.ico'),
+    title:           '異動届出書 入力ツール',
+    width:           900,
+    height:          920,
+    minWidth:        860,
+    minHeight:       600,
     webPreferences: {
       preload,
-      // Warning: Enable nodeIntegration and disable contextIsolation is not secure in production
-      // nodeIntegration: true,
-
-      // Consider using contextBridge.exposeInMainWorld
-      // Read more on https://www.electronjs.org/docs/latest/tutorial/context-isolation
-      // contextIsolation: false,
+      contextIsolation: true,
+      nodeIntegration:  false,
     },
   })
 
-  if (VITE_DEV_SERVER_URL) { // #298
+  if (VITE_DEV_SERVER_URL) {
     win.loadURL(VITE_DEV_SERVER_URL)
-    // Open devTool if the app is not packaged
     win.webContents.openDevTools()
   } else {
     win.loadFile(indexHtml)
   }
 
-  // Test actively push message to the Electron-Renderer
   win.webContents.on('did-finish-load', () => {
     win?.webContents.send('main-process-message', new Date().toLocaleString())
   })
 
-  // Make all links open with the browser, not with the application
   win.webContents.setWindowOpenHandler(({ url }) => {
     if (url.startsWith('https:')) shell.openExternal(url)
     return { action: 'deny' }
   })
-  // win.webContents.on('will-navigate', (event, url) => { }) #344
 }
+// #endregion
 
+// #region IPC — PDF
+ipcMain.handle('read-pdf', async () => {
+  const pdfPath = path.join(process.env.VITE_PUBLIC!, 'form.pdf')
+  return await fs.promises.readFile(pdfPath)
+})
+// #endregion
+
+// #region IPC — Print
+ipcMain.handle('print', () => {
+  if (!win) return
+  win.webContents.print(
+    {
+      silent: false,
+      printBackground: false,
+      pageSize: 'A4',
+      landscape: false,
+    },
+    (success, errorType) => {
+      if (!success) console.error('Print failed:', errorType)
+    }
+  )
+})
+// #endregion
+
+// #region IPC — File Save / Load
+ipcMain.handle('save-data', async (_event, jsonString: string) => {
+  const result = await dialog.showSaveDialog(win!, {
+    title: 'データを保存',
+    defaultPath: '異動届出書_データ.json',
+    filters: [{ name: 'JSON', extensions: ['json'] }],
+  })
+  if (result.canceled || !result.filePath) return { success: false }
+  await fs.promises.writeFile(result.filePath, jsonString, 'utf-8')
+  return { success: true }
+})
+
+ipcMain.handle('load-data', async () => {
+  const result = await dialog.showOpenDialog(win!, {
+    title: 'データを読み込む',
+    filters: [{ name: 'JSON', extensions: ['json'] }],
+    properties: ['openFile'],
+  })
+  if (result.canceled || !result.filePaths[0]) return { success: false, data: '' }
+  const data = await fs.promises.readFile(result.filePaths[0], 'utf-8')
+  return { success: true, data }
+})
+// #endregion
+
+// #region App Events
 app.whenReady().then(createWindow)
 
 app.on('window-all-closed', () => {
@@ -87,7 +123,6 @@ app.on('window-all-closed', () => {
 
 app.on('second-instance', () => {
   if (win) {
-    // Focus on the main window if the user tried to open another
     if (win.isMinimized()) win.restore()
     win.focus()
   }
@@ -95,26 +130,7 @@ app.on('second-instance', () => {
 
 app.on('activate', () => {
   const allWindows = BrowserWindow.getAllWindows()
-  if (allWindows.length) {
-    allWindows[0].focus()
-  } else {
-    createWindow()
-  }
+  if (allWindows.length) allWindows[0].focus()
+  else createWindow()
 })
-
-// New window example arg: new windows url
-ipcMain.handle('open-win', (_, arg) => {
-  const childWindow = new BrowserWindow({
-    webPreferences: {
-      preload,
-      nodeIntegration: true,
-      contextIsolation: false,
-    },
-  })
-
-  if (VITE_DEV_SERVER_URL) {
-    childWindow.loadURL(`${VITE_DEV_SERVER_URL}#${arg}`)
-  } else {
-    childWindow.loadFile(indexHtml, { hash: arg })
-  }
-})
+// #endregion

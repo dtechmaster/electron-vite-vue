@@ -87,14 +87,17 @@ function scheduleSave(): void {
 //#endregion
 
 //#region PDF Rendering
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let pdfDoc: any = null
+
 async function renderPDF(buffer: ArrayBuffer): Promise<void> {
   isLoaded.value  = false
   loadError.value = null
   pdfImgSrc.value = ''
 
   try {
-    const pdf      = await pdfjsLib.getDocument({ data: new Uint8Array(buffer) }).promise
-    const page     = await pdf.getPage(1)
+    pdfDoc     = await pdfjsLib.getDocument({ data: new Uint8Array(buffer) }).promise
+    const page = await pdfDoc.getPage(1)
     const viewport = page.getViewport({ scale: 2.0 })
     const canvas   = document.createElement('canvas')
     canvas.width   = viewport.width
@@ -317,6 +320,78 @@ function resetPositions(): void {
 }
 //#endregion
 
+//#region Annotation Detection
+interface IDetectedField {
+  fieldName: string
+  fieldType: string
+  left:   string
+  top:    string
+  width:  string
+  height: string
+  matchedId: string | null
+}
+
+const detectResult  = ref<IDetectedField[]>([])
+const detectStatus  = ref<'idle' | 'running' | 'done' | 'error'>('idle')
+const detectMessage = ref('')
+const showDetectPanel = ref(false)
+
+async function detectAnnotations(): Promise<void> {
+  if (!pdfDoc) return
+  detectStatus.value  = 'running'
+  detectMessage.value = ''
+  showDetectPanel.value = true
+
+  try {
+    const page  = await pdfDoc.getPage(1)
+    const vp    = page.getViewport({ scale: 1.0 })
+    const annotations = await page.getAnnotations()
+
+    const widgets = annotations.filter((a: any) => a.subtype === 'Widget' && a.rect)
+
+    if (widgets.length === 0) {
+      detectStatus.value  = 'done'
+      detectMessage.value = 'このPDFにはAcroFormフィールドが見つかりませんでした。'
+      detectResult.value  = []
+      return
+    }
+
+    detectResult.value = widgets.map((a: any): IDetectedField => {
+      const [x0, y0, x1, y1] = a.rect as number[]
+      const left   = ((x0 / vp.width)           * 100).toFixed(2) + '%'
+      const top    = (((vp.height - y1) / vp.height) * 100).toFixed(2) + '%'
+      const width  = (((x1 - x0) / vp.width)    * 100).toFixed(2) + '%'
+      const height = (((y1 - y0) / vp.height)   * 100).toFixed(2) + '%'
+
+      // Try to match to a known field ID
+      const name      = (a.fieldName ?? a.id ?? '') as string
+      const matchedId = $fields.find(name) ? name : null
+
+      return { fieldName: name, fieldType: a.fieldType ?? '?', left, top, width, height, matchedId }
+    })
+
+    detectStatus.value  = 'done'
+    detectMessage.value = `${widgets.length} 件のフィールドを検出 — ${detectResult.value.filter(d => d.matchedId).length} 件マッチ`
+  } catch (err) {
+    detectStatus.value  = 'error'
+    detectMessage.value = err instanceof Error ? err.message : String(err)
+    console.error('[PdfForm] detectAnnotations failed:', err)
+  }
+}
+
+function applyDetected(): void {
+  const matched = detectResult.value.filter(d => d.matchedId)
+  for (const d of matched) {
+    const id  = d.matchedId!
+    const pos = { ...(savedPositions.value[id] ?? {}), left: d.left, top: d.top, width: d.width, height: d.height }
+    savedPositions.value = { ...savedPositions.value, [id]: pos }
+    $formStore.savePosition(id, pos)
+  }
+  showDetectPanel.value = false
+  detectStatus.value    = 'idle'
+}
+//#endregion
+
 //#region Field Selection & Style Toolbar
 function selectField(id: string): void {
   activeFieldId.value = id
@@ -381,7 +456,7 @@ function resetFieldStyle(): void {
 //#endregion
 
 // Expose for parent (print)
-defineExpose({ calibrateMode, resetPositions })
+defineExpose({ calibrateMode, resetPositions, detectAnnotations })
 </script>
 
 <template>
@@ -399,7 +474,59 @@ defineExpose({ calibrateMode, resetPositions })
       <code>{{ mouseCoords }}</code>
       <span v-if="selectedField !== '—'"> | <code>{{ selectedField }}</code></span>
       &nbsp;·&nbsp;<kbd>ESC</kbd> で終了
+      <button class="btn-detect" @click="detectAnnotations">🔍 フィールド検出</button>
       <button class="btn-reset-pos" @click="resetPositions">↺ 位置リセット</button>
+    </div>
+  </Transition>
+  <!--#endregion-->
+
+  <!--#region Detection Panel -->
+  <Transition name="banner">
+    <div v-if="showDetectPanel" class="detect-panel">
+      <div class="detect-header">
+        <span class="detect-title">🔍 AcroForm フィールド検出</span>
+        <button class="detect-close" @click="showDetectPanel = false">✕</button>
+      </div>
+
+      <div v-if="detectStatus === 'running'" class="detect-msg">検出中...</div>
+
+      <div v-else-if="detectMessage" class="detect-msg" :class="{ 'detect-msg-warn': detectResult.length === 0 }">
+        {{ detectMessage }}
+      </div>
+
+      <template v-if="detectResult.length > 0">
+        <div class="detect-table-wrap">
+          <table class="detect-table">
+            <thead>
+              <tr><th>fieldName</th><th>type</th><th>left</th><th>top</th><th>w</th><th>h</th><th>マッチ</th></tr>
+            </thead>
+            <tbody>
+              <tr
+                v-for="d in detectResult"
+                :key="d.fieldName"
+                :class="{ matched: d.matchedId }"
+              >
+                <td>{{ d.fieldName }}</td>
+                <td>{{ d.fieldType }}</td>
+                <td>{{ d.left }}</td>
+                <td>{{ d.top }}</td>
+                <td>{{ d.width }}</td>
+                <td>{{ d.height }}</td>
+                <td>{{ d.matchedId ?? '—' }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="detect-actions">
+          <button
+            class="detect-btn-apply"
+            :disabled="detectResult.filter(d => d.matchedId).length === 0"
+            @click="applyDetected"
+          >
+            ✔ マッチした {{ detectResult.filter(d => d.matchedId).length }} 件を適用
+          </button>
+        </div>
+      </template>
     </div>
   </Transition>
   <!--#endregion-->
@@ -586,6 +713,18 @@ defineExpose({ calibrateMode, resetPositions })
   font-family: monospace;
 }
 
+.btn-detect {
+  padding: 2px 10px;
+  border: 1px solid #89b4fa;
+  border-radius: 4px;
+  background: transparent;
+  color: #89b4fa;
+  font-size: 11px;
+  cursor: pointer;
+  transition: background 0.12s;
+}
+.btn-detect:hover { background: rgba(137,180,250,0.15); }
+
 .btn-reset-pos {
   margin-left: auto;
   padding: 2px 10px;
@@ -601,6 +740,85 @@ defineExpose({ calibrateMode, resetPositions })
 
 .banner-enter-active, .banner-leave-active { transition: opacity 0.15s, transform 0.15s; }
 .banner-enter-from, .banner-leave-to { opacity: 0; transform: translateY(-4px); }
+/*#endregion*/
+
+/*#region Detection Panel */
+.detect-panel {
+  flex-shrink: 0;
+  background: #181825;
+  border-bottom: 1px solid #313244;
+  padding: 10px 16px;
+  font-size: 12px;
+  color: #cdd6f4;
+  max-height: 260px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.detect-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.detect-title {
+  font-weight: 700;
+  color: #89b4fa;
+  flex: 1;
+}
+
+.detect-close {
+  background: transparent;
+  border: none;
+  color: #6c7086;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 0 2px;
+}
+.detect-close:hover { color: #f38ba8; }
+
+.detect-msg { color: #a6adc8; font-size: 12px; }
+.detect-msg-warn { color: #fab387; }
+
+.detect-table-wrap { overflow: auto; flex: 1; }
+
+.detect-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+  font-family: monospace;
+}
+.detect-table th {
+  text-align: left;
+  color: #6c7086;
+  padding: 2px 8px 2px 0;
+  border-bottom: 1px solid #313244;
+  white-space: nowrap;
+}
+.detect-table td {
+  padding: 2px 8px 2px 0;
+  color: #a6adc8;
+  white-space: nowrap;
+}
+.detect-table tr.matched td { color: #a6e3a1; }
+
+.detect-actions { display: flex; justify-content: flex-end; }
+
+.detect-btn-apply {
+  padding: 4px 14px;
+  background: #a6e3a1;
+  color: #1e1e2e;
+  border: none;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: opacity 0.1s;
+}
+.detect-btn-apply:hover:not(:disabled) { opacity: 0.85; }
+.detect-btn-apply:disabled { opacity: 0.35; cursor: default; }
 /*#endregion*/
 
 /*#region Form Scroll */

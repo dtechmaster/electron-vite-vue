@@ -7,9 +7,9 @@ import pkg from './package.json'
 
 // Copy pdfjs worker into public/ so it's available in both dev server and prod build
 function copyPdfWorker() {
-  const src  = path.resolve('node_modules/pdfjs-dist/build/pdf.worker.mjs')
-  const dest = path.resolve('public/pdf.worker.mjs')
-  try { fs.copyFileSync(src, dest) } catch { /* handled at runtime */ }
+  const src  = path.resolve('node_modules/pdfjs-dist/build/pdf.worker.js')
+  const dest = path.resolve('public/pdf.worker.js')
+  try { fs.copyFileSync(src, dest) } catch (e) { console.error('[vite] Failed to copy pdf.worker.js:', e) }
 }
 
 // https://vitejs.dev/config/
